@@ -1,0 +1,12 @@
+domain: kubermatic.com
+layout:
+- go.kubebuilder.io/v3
+projectName: image-clone-controller
+repo: github.com/navarrothiago/image-clone-controller
+resources:
+- controller: true
+  domain: kubermatic.com
+  group: controllergroup
+  kind: ImageClone
+  version: v1
+version: "3"
