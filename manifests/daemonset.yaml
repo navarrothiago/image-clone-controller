@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+spec:
+  selector:
+      matchLabels:
+        name: fluent-bit # Label selector that determines which Pods belong to the DaemonSet
+  template:
+    metadata:
+      labels:
+        name: fluent-bit # Pod template's label selector
+    spec:
+      containers:
+      - name: fluent-bit
+        image: gcr.io/cloud-solutions-images/fluent-bit:1.6
+        resources:
+          limits:
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 200Mi

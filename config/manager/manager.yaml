@@ -56,5 +56,21 @@ spec:
           requests:
             cpu: 10m
             memory: 64Mi
+        env:
+        - name: DOCKER_REGISTRY
+          valueFrom:
+            secretKeyRef:
+              name: docker-registry-credentials
+              key: docker-server
+        - name: DOCKER_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: docker-registry-credentials
+              key: docker-username
+        - name: DOCKER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: docker-registry-credentials
+              key: docker-password
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10

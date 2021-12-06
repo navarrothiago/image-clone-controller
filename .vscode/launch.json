@@ -9,7 +9,11 @@
       "type": "go",
       "request": "launch",
       "mode": "debug",
-      "program": "${file}"
+      "program": "${file}",
+      "env": {
+        "DOCKER_USERNAME": "navarrothiago",
+        "DOCKER_PASSWORD": "d0814536-d76f-4079-899b-498d0db6b043"
+      }
     }
 
   ]

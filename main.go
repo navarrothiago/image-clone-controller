@@ -31,7 +31,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	"github.com/caarlos0/env"
+	"github.com/navarrothiago/image-clone-controller/config"
 	"github.com/navarrothiago/image-clone-controller/controllers"
+	"github.com/navarrothiago/image-clone-controller/imagecloner"
+	"github.com/navarrothiago/image-clone-controller/objects"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -50,6 +54,8 @@ func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
 	var probeAddr string
+	cfg := config.Config{}
+
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -60,6 +66,7 @@ func main() {
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	env.Parse(&cfg)
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
@@ -76,11 +83,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controllers.ImageCloneReconciler{
+	deploymentController := &controllers.ImageCloneReconciler{
 		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("image-controler-reconciler"),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
+		Object: objects.NewDeploymentObject(),
+		Cfg:    cfg,
+		Cloner: imagecloner.NewCloner(ctrl.Log.WithName("cloner-deployment"), cfg),
+		Logger: ctrl.Log.WithName("controller-deployment"),
+	}
+
+	if err = deploymentController.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ImageClone")
+		os.Exit(1)
+	}
+
+	daemonSetController := &controllers.ImageCloneReconciler{
+		Client: mgr.GetClient(),
+		Object: objects.NewDaemonSetObject(),
+		Cfg:    cfg,
+		Cloner: imagecloner.NewCloner(ctrl.Log.WithName("cloner-daemonset"), cfg),
+		Logger: ctrl.Log.WithName("controller-daemonset"),
+	}
+	if err = daemonSetController.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ImageClone")
 		os.Exit(1)
 	}

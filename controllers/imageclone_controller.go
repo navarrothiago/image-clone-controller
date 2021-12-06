@@ -19,105 +19,173 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 
 	"github.com/go-logr/logr"
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/navarrothiago/image-clone-controller/config"
+	"github.com/navarrothiago/image-clone-controller/imagecloner"
+	"github.com/navarrothiago/image-clone-controller/objects"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 // ImageCloneReconciler reconciles a ImageClone object
 type ImageCloneReconciler struct {
-	client.Client
-	Log    logr.Logger
-	Scheme *runtime.Scheme
+	// Client can be used to retrieve objects from the APIServer.
+	Client client.Client
+
+	// Object holds the bind type for the process
+	Object objects.Object
+
+	// Cfg controller configs
+	Cfg config.Config
+
+	// Cloner is the image clone object from source repository to target repository
+	Cloner imagecloner.Cloner
+
+	logr.Logger
 }
 
-//+kubebuilder:rbac:groups=controllergroup.kubermatic.com,resources=imageclones,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=controllergroup.kubermatic.com,resources=imageclones/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=controllergroup.kubermatic.com,resources=imageclones/finalizers,verbs=update
-//+kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;
-
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the ImageClone object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.10.0/pkg/reconcile
 func (r *ImageCloneReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// set up a convenient log object so we don't have to type request over and over again
-	log := log.FromContext(ctx)
+	logger := log.FromContext(ctx)
 
-	// Fetch the ReplicaSet from the cache
-	rs := &appsv1.ReplicaSet{}
+	logger.Info(`starting reconcile`)
+
+	// Fetch the controller
+	rs := r.Object.Get()
 	err := r.Client.Get(ctx, req.NamespacedName, rs)
 	if errors.IsNotFound(err) {
-		log.Error(nil, "Could not find ReplicaSet")
 		return reconcile.Result{}, nil
 	}
-
 	if err != nil {
-		return reconcile.Result{}, fmt.Errorf("could not fetch ReplicaSet: %+v", err)
+		return reconcile.Result{}, fmt.Errorf("could not fetch %s: %+v", r.Object.Name(), err)
 	}
 
-	// Print the ReplicaSet
-	log.Info("Reconciling ReplicaSet", "container name", rs.Spec.Template.Spec.Containers[0].Name)
+	newCopy := r.Object.NewCopy()
+	wg := sync.WaitGroup{}
+	errorChan := make(chan error, len(r.Object.Containers()))
 
-	// Set the label if it is missing
-	if rs.Labels == nil {
-		rs.Labels = map[string]string{}
+	for i, container := range r.Object.Containers() {
+		newName, isChanged, err := r.generateNewImageName(container.Image)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+
+		if isChanged {
+			newCopy.OverrideImage(i, newName.Name())
+
+			wg.Add(1)
+			go func(imageName string) {
+				defer wg.Done()
+
+				source, _ := name.ParseReference(imageName)
+				if source.Identifier() != `latest` {
+					_, exist := r.Cloner.IsExistInClones(ctx, newName)
+					if exist {
+						return
+					}
+				}
+
+				err := r.Cloner.Clone(ctx, source, newName)
+				if err != nil {
+					errorChan <- err
+				}
+			}(container.Image)
+		}
 	}
-	if rs.Labels["hello"] == "world" {
-		return reconcile.Result{}, nil
+	wg.Wait()
+	close(errorChan)
+
+	var errs []string
+	for err := range errorChan {
+		errs = append(errs, err.Error())
+	}
+	if len(errs) > 0 {
+		return reconcile.Result{}, fmt.Errorf("error clonning the docker images: %v", strings.Join(errs, " | "))
 	}
 
-	// Update the ReplicaSet
-	rs.Labels["hello"] = "world"
-	err = r.Client.Update(ctx, rs)
+	patchObject := client.StrategicMergeFrom(rs)
+
+	// Patch data object
+	// NOTE: if used Update instead of patch, it will conflict with the parallel changes and output errors
+	err = r.Client.Patch(ctx, newCopy.Get(), patchObject) //err = r.client.Update(ctx, rs)
 	if err != nil {
-		return reconcile.Result{}, fmt.Errorf("could not write ReplicaSet: %+v", err)
+		return reconcile.Result{}, fmt.Errorf("could not write %s: %+v", r.Object.Name(), err)
 	}
+
+	logger.Info(`reconcile completed`)
 
 	return reconcile.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
+// func (r *ImageCloneReconciler) SetupWithManager(mgr ctrl.Manager, ob objects.Object, config config.Config, cloner imagecloner.Cloner) error {
 func (r *ImageCloneReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	r.Log.Info("Setting up controller")
-	c, err := controller.New("image-clone-controller", mgr, controller.Options{
-		Reconciler: &ImageCloneReconciler{Client: mgr.GetClient()},
+	c, err := controller.New(r.Object.Name(), mgr, controller.Options{
+		Reconciler: r,
 	})
 	if err != nil {
-		r.Log.Error(err, "unable to set up individual controller")
+		r.Error(err, "unable to set up individual controller")
 		return err
 	}
 
-	// Watch ReplicaSets and enqueue ReplicaSet object key
-	if err := c.Watch(&source.Kind{Type: &appsv1.ReplicaSet{}}, &handler.EnqueueRequestForObject{}); err != nil {
-		r.Log.Error(err, "unable to watch ReplicaSets")
-		return err
-	}
+	// Watch received Object and based on the given predicate
+	err = c.Watch(&source.Kind{Type: r.Object.Get()}, &handler.EnqueueRequestForObject{},
+		predicate.And(
+			predicate.NewPredicateFuncs(func(object client.Object) bool {
+				switch object.GetNamespace() {
+				// TODO (navarrothiago) Get namespace from config file.
+				case "kube-system", "kubernetes-dashboard", "image-clone-controller-system":
+					return false
+				}
+				return true
+			}),
+			predicate.Funcs{
+				DeleteFunc: func(event event.DeleteEvent) bool {
+					return false
+				},
+				GenericFunc: func(event event.GenericEvent) bool {
+					return false
+				},
+			},
+		),
+	)
 
-	// Watch Pods and enqueue owning ReplicaSet key
-	if err := c.Watch(&source.Kind{Type: &corev1.Pod{}},
-		&handler.EnqueueRequestForOwner{OwnerType: &appsv1.ReplicaSet{}, IsController: true}); err != nil {
-		r.Log.Error(err, "unable to watch Pods")
+	if err != nil {
+		r.Error(err, "unable to watch "+r.Object.Get().GetName())
 		return err
 	}
 	return nil
+}
 
+func (r *ImageCloneReconciler) generateNewImageName(imageName string) (n name.Reference, isChanged bool, err error) {
+	source, err := name.ParseReference(imageName)
+	if err != nil {
+		return nil, false, err
+	}
+	r.Info(fmt.Sprintf("source image: %s", source.String()))
+	if strings.Contains(source.String(), r.Cfg.DockerRegistry+"/"+r.Cfg.DockerUsername) {
+		r.Info(fmt.Sprintf("source image already exists in %s/%s registry ", r.Cfg.DockerUsername, r.Cfg.DockerRegistry))
+		return source, false, nil
+	}
+
+	target, err := name.ParseReference(r.Cfg.DockerUsername+"/"+strings.ReplaceAll(source.Context().RepositoryStr(), "/", "_")+":"+source.Identifier(), name.WithDefaultRegistry(r.Cfg.DockerRegistry))
+	if err != nil {
+		return nil, false, err
+	}
+
+	return target, true, nil
 }
